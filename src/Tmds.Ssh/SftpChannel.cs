@@ -766,9 +766,12 @@ sealed partial class SftpChannel : IDisposable
 #endif
     }
 
-    private static UnixFilePermissions GetPermissionsForFile(SafeFileHandle fileHandle)
+    private static UnixFilePermissions GetPermissionsForFile(SafeFileHandle? fileHandle)
     {
         const UnixFilePermissions Default = SftpClient.DefaultCreateFilePermissions & ~PretendUMask;
+
+        if (fileHandle is null) return Default;
+
 #if NET7_0_OR_GREATER
         if (!OperatingSystem.IsWindows())
         {
@@ -783,12 +786,23 @@ sealed partial class SftpChannel : IDisposable
     public async ValueTask UploadFileAsync(string localPath, string remotePath, long? length, bool overwrite, UnixFilePermissions? permissions, CancellationToken cancellationToken)
     {
         using SafeFileHandle localFile = File.OpenHandle(localPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using LocalResourceReader localResource = new(localFile);
+        await UploadFileAsync(localResource, remotePath, length, overwrite, permissions, cancellationToken).ConfigureAwait(false);
+    }
 
-        permissions ??= GetPermissionsForFile(localFile);
+    public async ValueTask UploadFileAsync(Stream source, string remotePath, long? length, bool overwrite, UnixFilePermissions? permissions, CancellationToken cancellationToken)
+    {
+        using LocalResourceReader localResource = new(source);
+        await UploadFileAsync(localResource, remotePath, length, overwrite, permissions, cancellationToken).ConfigureAwait(false);
+    }
 
-        using SftpFile remoteFile = (await OpenFileCoreAsync(remotePath, (overwrite ? SftpOpenFlags.OpenOrCreate : SftpOpenFlags.CreateNew) | SftpOpenFlags.Write, permissions.Value, SftpClient.DefaultFileOpenOptions, cancellationToken).ConfigureAwait(false))!;
+    private async ValueTask UploadFileAsync(LocalResourceReader source, string? remotePath, long? length, bool overwrite, UnixFilePermissions? permissions, CancellationToken cancellationToken)
+    {
+        permissions ??= GetPermissionsForFile(source.FileHandle);
 
-        length ??= RandomAccess.GetLength(localFile);
+        using SftpFile remoteFile = (await OpenFileCoreAsync(remotePath!, (overwrite ? SftpOpenFlags.OpenOrCreate : SftpOpenFlags.CreateNew) | SftpOpenFlags.Write, permissions.Value, SftpClient.DefaultFileOpenOptions, cancellationToken).ConfigureAwait(false))!;
+
+        length ??= source.Length;
 
         ValueTask previous = default;
 
@@ -823,7 +837,7 @@ sealed partial class SftpChannel : IDisposable
                     buffer = ArrayPool<byte>.Shared.Rent(length);
                     do
                     {
-                        int bytesRead = RandomAccess.Read(localFile, buffer.AsSpan(0, length), offset);
+                        int bytesRead = source.ReadAtOffset(buffer.AsSpan(0, length), offset);
                         if (bytesRead == 0)
                         {
                             break;
